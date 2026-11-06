@@ -30,10 +30,12 @@ type Entry struct {
 // ErrUnavailable is returned when the ledger cannot be reached. Retrying may succeed.
 var ErrUnavailable = errors.New("ledger: unavailable")
 
+// ErrNoAward is returned when a payment has no award to reverse.
+var ErrNoAward = errors.New("ledger: no award for payment")
+
 type Store interface {
-	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
-	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
-	Append(ctx context.Context, e Entry) error
+	Award(ctx context.Context, e Entry, monthlyCap int64) error
+	Reverse(ctx context.Context, paymentID string) error
 	Balance(ctx context.Context, memberID string) (int64, error)
 }
 
@@ -80,33 +82,58 @@ func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
 	return nil
 }
 
-func (s *MemoryStore) HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error) {
-	if err := s.roundTrip(ctx, "has_entry"); err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// find requires s.mu to be held.
+func (s *MemoryStore) find(paymentID string, kind Kind) (Entry, bool) {
 	for _, e := range s.entries {
 		if e.PaymentID == paymentID && e.Kind == kind {
-			return true, nil
+			return e, true
 		}
 	}
-	return false, nil
+	return Entry{}, false
 }
 
-func (s *MemoryStore) AwardedInMonth(ctx context.Context, memberID, month string) (int64, error) {
-	if err := s.roundTrip(ctx, "awarded_in_month"); err != nil {
-		return 0, err
+// Award records a payment's award once, subject to the monthly cap.
+func (s *MemoryStore) Award(ctx context.Context, e Entry, monthlyCap int64) error {
+	if err := s.roundTrip(ctx, "award"); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var total int64
-	for _, e := range s.entries {
-		if e.MemberID == memberID && e.Month == month && e.Kind == KindAward {
-			total += e.Points
+	if _, exists := s.find(e.PaymentID, KindAward); exists {
+		return nil
+	}
+	var used int64
+	for _, entry := range s.entries {
+		if entry.MemberID == e.MemberID && entry.Month == e.Month && entry.Kind == KindAward {
+			used += entry.Points
 		}
 	}
-	return total, nil
+	if room := monthlyCap - used; e.Points > room {
+		e.Points = max(room, 0)
+	}
+	e.Kind = KindAward
+	s.entries = append(s.entries, e)
+	return nil
+}
+
+// Reverse records the negation of the original award once.
+func (s *MemoryStore) Reverse(ctx context.Context, paymentID string) error {
+	if err := s.roundTrip(ctx, "reverse"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	award, exists := s.find(paymentID, KindAward)
+	if !exists {
+		return ErrNoAward
+	}
+	if _, exists := s.find(paymentID, KindReversal); exists {
+		return nil
+	}
+	award.Kind = KindReversal
+	award.Points = -award.Points
+	s.entries = append(s.entries, award)
+	return nil
 }
 
 func (s *MemoryStore) Append(ctx context.Context, e Entry) error {
